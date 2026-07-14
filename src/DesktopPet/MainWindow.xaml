@@ -1,0 +1,26 @@
+<Window x:Class="DesktopPet.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:DesktopPet.Controls"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ResizeMode="NoResize"
+        Width="350" Height="480"
+        WindowStartupLocation="Manual"
+        Title="DesktopPet">
+    <Canvas x:Name="RootCanvas" Background="Transparent"
+            Width="350" Height="480">
+
+        <!-- Chat bubble positioned above robot area -->
+        <controls:ChatBubble x:Name="chatBubble"
+                             Canvas.Left="50" Canvas.Top="0"/>
+
+        <!-- The robot positioned at bottom center -->
+        <controls:PetRobot x:Name="petRobot"
+                           Canvas.Left="95" Canvas.Top="240"
+                           Cursor="Hand"/>
+    </Canvas>
+</Window>
