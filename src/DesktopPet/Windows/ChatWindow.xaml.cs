@@ -12,8 +12,10 @@ public partial class ChatWindow : Window
     private readonly ConfigService _configService;
     private readonly ControlService _controlService;
     private bool _isProcessing = false;
+    private CancellationTokenSource? _currentCts;
 
-    public ChatWindow(AiService aiService, ConfigService configService, ControlService controlService)
+    public ChatWindow(AiService aiService, ConfigService configService,
+        ControlService controlService)
     {
         InitializeComponent();
         _aiService = aiService;
@@ -26,22 +28,18 @@ public partial class ChatWindow : Window
 
     private void ChatWindow_Loaded(object sender, RoutedEventArgs e)
     {
-        // Set placeholder text
         InputTextBox.Text = (string)InputTextBox.Tag;
         InputTextBox.Foreground = System.Windows.Media.Brushes.Gray;
 
-        // Restore history
         foreach (var msg in _aiService.History)
-        {
             AddMessageToView(msg);
-        }
+
         ScrollToBottom();
     }
 
     private void ChatWindow_Closing(object? sender,
         System.ComponentModel.CancelEventArgs e)
     {
-        // Hide instead of close
         e.Cancel = true;
         this.Hide();
     }
@@ -93,68 +91,75 @@ public partial class ChatWindow : Window
         if (string.IsNullOrWhiteSpace(text) || text == (string)InputTextBox.Tag || _isProcessing)
             return;
 
-        // Clear input
+        // Cancel any ongoing request
+        _currentCts?.Cancel();
+        _currentCts = new CancellationTokenSource();
+
         InputTextBox.Text = "";
         _isProcessing = true;
         SendButton.IsEnabled = false;
 
-        // Add user message to view
         var userMsg = new ChatMessage { Role = "user", Content = text };
         AddMessageToView(userMsg);
 
         // Check API key
         if (string.IsNullOrWhiteSpace(_configService.Config.ApiKey))
         {
-            var noKeyMsg = new ChatMessage
+            AddMessageToView(new ChatMessage
             {
                 Role = "assistant",
                 Content = "主人还没有设置 API Key 呢~ 请先在设置中配置 DeepSeek 的 API Key，小Q才能和你聊天哦！(◕‿◕)"
-            };
-            AddMessageToView(noKeyMsg);
+            });
             _isProcessing = false;
             SendButton.IsEnabled = true;
             return;
         }
 
-        // Create streaming message placeholder
-        var streamBubble = CreateStreamingBubble();
-        MessagesList.Items.Add(streamBubble);
+        // Create streaming placeholder in the chat
+        var streamContainer = CreateStreamingPlaceholder();
+        MessagesList.Items.Add(streamContainer);
         ScrollToBottom();
 
-        // Stream response
         var fullResponse = "";
         try
         {
-            await foreach (var chunk in _aiService.ChatStreamAsync(text))
+            await foreach (var chunk in _aiService.ChatStreamAsync(text, _currentCts.Token))
             {
                 fullResponse += chunk;
-                // Update the streaming bubble text
-                UpdateStreamingBubble(streamBubble, fullResponse);
+                UpdateStreamingPlaceholder(streamContainer, fullResponse);
                 ScrollToBottom();
             }
+        }
+        catch (OperationCanceledException)
+        {
+            if (!string.IsNullOrEmpty(fullResponse))
+                fullResponse += "\n(已取消)";
+            else
+                fullResponse = "已取消发送~";
         }
         catch (Exception ex)
         {
             fullResponse = $"呜~ 出错了：{ex.Message} (´;ω;`)";
-            UpdateStreamingBubble(streamBubble, fullResponse);
         }
-
-        // Replace streaming bubble with final styled bubble
-        MessagesList.Items.Remove(streamBubble);
-        var assistantMsg = new ChatMessage { Role = "assistant", Content = fullResponse };
-        AddMessageToView(assistantMsg);
-
-        // Check for commands
-        var cmdResult = ParseAndExecuteCommand(fullResponse);
-        if (cmdResult != null)
+        finally
         {
-            var cmdMsg = new ChatMessage { Role = "assistant", Content = cmdResult };
-            AddMessageToView(cmdMsg);
-        }
+            // ALWAYS clean up — this is the critical fix
+            MessagesList.Items.Remove(streamContainer);
 
-        _isProcessing = false;
-        SendButton.IsEnabled = true;
-        ScrollToBottom();
+            var assistantMsg = new ChatMessage { Role = "assistant", Content = fullResponse };
+            AddMessageToView(assistantMsg);
+
+            // Check for computer control commands
+            var cmdResult = ParseAndExecuteCommand(fullResponse);
+            if (cmdResult != null)
+            {
+                AddMessageToView(new ChatMessage { Role = "assistant", Content = cmdResult });
+            }
+
+            _isProcessing = false;
+            SendButton.IsEnabled = true;
+            ScrollToBottom();
+        }
     }
 
     #endregion
@@ -167,7 +172,6 @@ public partial class ChatWindow : Window
         {
             var match = System.Text.RegularExpressions.Regex.Match(
                 response, @"【命令[:：](.*?)】");
-
             if (match.Success)
             {
                 var command = match.Groups[1].Value.Trim();
@@ -189,12 +193,11 @@ public partial class ChatWindow : Window
 
         if (msg.Role == "user")
         {
-            // User message (right-aligned, blue)
             var border = new Border
             {
                 Style = (Style)FindResource("UserBubbleStyle")
             };
-            var textBlock = new TextBlock
+            border.Child = new TextBlock
             {
                 Text = msg.Content,
                 FontSize = 13,
@@ -202,14 +205,13 @@ public partial class ChatWindow : Window
                 TextWrapping = TextWrapping.Wrap,
                 LineHeight = 20
             };
-            border.Child = textBlock;
 
-            // Time label
             var timeLabel = new TextBlock
             {
                 Text = msg.Timestamp.ToString("HH:mm"),
                 FontSize = 10,
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x99, 0xAA, 0xBB)),
+                Foreground = new SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0x99, 0xAA, 0xBB)),
                 HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
                 Margin = new Thickness(0, 1, 14, 0)
             };
@@ -219,28 +221,27 @@ public partial class ChatWindow : Window
         }
         else
         {
-            // Assistant message (left-aligned, white)
             var border = new Border
             {
                 Style = (Style)FindResource("AssistantBubbleStyle")
             };
-            var textBlock = new TextBlock
+            border.Child = new TextBlock
             {
                 Text = msg.Content,
                 FontSize = 13,
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x1A, 0x1A, 0x2E)),
+                Foreground = new SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0x1A, 0x1A, 0x2E)),
                 TextWrapping = TextWrapping.Wrap,
                 LineHeight = 20
             };
-            border.Child = textBlock;
 
-            // Name label
             var nameLabel = new TextBlock
             {
                 Text = _configService.Config.RobotName,
                 FontSize = 11,
                 FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x4A, 0x90, 0xD9)),
+                Foreground = new SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0x4A, 0x90, 0xD9)),
                 Margin = new Thickness(16, 0, 0, 1)
             };
 
@@ -251,43 +252,51 @@ public partial class ChatWindow : Window
         MessagesList.Items.Add(container);
     }
 
-    private Border CreateStreamingBubble()
+    /// <summary>
+    /// Create a streaming placeholder StackPanel that can be updated in-place
+    /// </summary>
+    private StackPanel CreateStreamingPlaceholder()
     {
+        var container = new StackPanel { Margin = new Thickness(0, 2, 0, 2) };
+
+        var nameLabel = new TextBlock
+        {
+            Text = _configService.Config.RobotName + " 正在输入...",
+            FontSize = 11,
+            Foreground = new SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0x4A, 0x90, 0xD9)),
+            Margin = new Thickness(16, 0, 0, 1)
+        };
+
         var border = new Border
         {
             Style = (Style)FindResource("AssistantBubbleStyle"),
             Tag = "streaming"
         };
-
-        var textBlock = new TextBlock
+        border.Child = new TextBlock
         {
             Text = "正在思考...",
             FontSize = 13,
-            Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x1A, 0x1A, 0x2E)),
+            Foreground = new SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0x1A, 0x1A, 0x2E)),
             TextWrapping = TextWrapping.Wrap,
             LineHeight = 20,
             FontStyle = FontStyles.Italic
         };
-        border.Child = textBlock;
 
-        var container = new StackPanel();
-        var nameLabel = new TextBlock
-        {
-            Text = _configService.Config.RobotName + " 正在输入...",
-            FontSize = 11,
-            Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x4A, 0x90, 0xD9)),
-            Margin = new Thickness(16, 0, 0, 1)
-        };
         container.Children.Add(nameLabel);
         container.Children.Add(border);
         container.Tag = "streaming";
 
-        return border;
+        return container;
     }
 
-    private void UpdateStreamingBubble(Border bubble, string text)
+    private void UpdateStreamingPlaceholder(StackPanel container, string text)
     {
-        if (bubble.Child is TextBlock tb)
+        // The second child is the Border containing the TextBlock
+        if (container.Children.Count >= 2 &&
+            container.Children[1] is Border border &&
+            border.Child is TextBlock tb)
         {
             tb.Text = text;
             tb.FontStyle = FontStyles.Normal;
@@ -296,7 +305,11 @@ public partial class ChatWindow : Window
 
     private void ScrollToBottom()
     {
-        ChatScrollViewer.ScrollToEnd();
+        // Defer scroll to ensure layout is updated
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            ChatScrollViewer.ScrollToEnd();
+        }), System.Windows.Threading.DispatcherPriority.Loaded);
     }
 
     #endregion

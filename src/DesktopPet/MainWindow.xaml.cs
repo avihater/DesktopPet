@@ -51,6 +51,7 @@ public partial class MainWindow : Window
         if (_voiceService != null)
         {
             _voiceService.SpeechRecognized += VoiceService_SpeechRecognized;
+            _voiceService.SpeechNotRecognized += VoiceService_SpeechNotRecognized;
             _voiceService.StateChanged += VoiceService_StateChanged;
         }
     }
@@ -71,19 +72,31 @@ public partial class MainWindow : Window
     {
         if (_voiceService == null || !_voiceService.IsAvailable)
         {
-            ShowBubbleMessage("语音服务不可用呢~ 请检查系统语音设置 (◕‿◕)");
+            ShowBubbleMessage("语音服务不可用呢~\n请检查 Windows 语音设置中是否安装了中文语音 (◕‿◕)");
             return;
         }
 
+        // If already listening, cancel
         if (_voiceService.CurrentState == VoiceState.Listening)
         {
             _voiceService.CancelListening();
             return;
         }
 
+        // If currently speaking, stop and start new listening
         if (_voiceService.CurrentState == VoiceState.Speaking)
         {
             _voiceService.StopSpeaking();
+            // Small delay to let TTS clean up
+            Task.Delay(200).ContinueWith(_ =>
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    _voiceService.StartListening();
+                    petRobot.SetListeningState(true);
+                });
+            });
+            return;
         }
 
         // Start listening
@@ -91,31 +104,53 @@ public partial class MainWindow : Window
         petRobot.SetListeningState(true);
     }
 
+    /// <summary>
+    /// Called when speech was recognized successfully
+    /// </summary>
     private async void VoiceService_SpeechRecognized(string text)
     {
-        // Update UI on dispatcher thread
+        await ProcessVoiceInput(text);
+    }
+
+    /// <summary>
+    /// Called when recognizer heard sound but couldn't understand it
+    /// </summary>
+    private void VoiceService_SpeechNotRecognized()
+    {
+        Dispatcher.Invoke(() =>
+        {
+            petRobot.SetListeningState(false);
+            ShowBubbleMessage("嗯…没听清呢，主人再说一遍？(．ω．)");
+        });
+    }
+
+    /// <summary>
+    /// Core voice processing: send recognized text to AI, display response, speak via TTS
+    /// </summary>
+    private async Task ProcessVoiceInput(string recognizedText)
+    {
         await Dispatcher.InvokeAsync(async () =>
         {
             petRobot.SetListeningState(false);
 
             // Show what was heard
-            ShowBubbleMessage($"听到了: \"{text}\"", autoHide: false);
+            ShowBubbleMessage($"🎤 听到了: \"{recognizedText}\"", autoHide: false);
 
             // Check API key
             if (string.IsNullOrWhiteSpace(_configService.Config.ApiKey))
             {
-                ShowBubbleMessage("主人还没设置 API Key 呢~ 请先在设置中配置一下！");
+                ShowBubbleMessage("主人还没设置 API Key 呢~\n请先在设置中配置 DeepSeek 的 API Key！");
                 return;
             }
 
-            // Chat bubble shows typing
+            // Show typing indicator
             chatBubble.ShowTyping();
 
             // Stream AI response
             var fullResponse = "";
             try
             {
-                await foreach (var chunk in _aiService.ChatStreamAsync(text))
+                await foreach (var chunk in _aiService.ChatStreamAsync(recognizedText))
                 {
                     fullResponse += chunk;
                     chatBubble.AppendStreamChunk(chunk);
@@ -123,22 +158,22 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                fullResponse = $"呜~ 出错了：{ex.Message} (´;ω;`)";
+                fullResponse = $"呜~ 出错了：{ex.Message}";
                 chatBubble.ShowMessage(fullResponse);
             }
 
             chatBubble.FinishStreaming(autoHide: true);
 
-            // Check for computer control commands in the response
+            // Execute any computer commands embedded in response
             var commandResult = ParseAndExecuteCommand(fullResponse);
             if (commandResult != null)
             {
-                await Task.Delay(500); // Brief pause
+                await Task.Delay(400);
                 ShowBubbleMessage(commandResult);
             }
 
-            // Speak the response via TTS
-            if (_voiceService != null && _voiceService.IsAvailable)
+            // ---- CRITICAL: Speak the response via TTS ----
+            if (_voiceService != null && _voiceService.IsAvailable && !string.IsNullOrWhiteSpace(fullResponse))
             {
                 _voiceService.Speak(fullResponse);
                 petRobot.SetSpeakingState(true);
@@ -158,8 +193,10 @@ public partial class MainWindow : Window
                     break;
                 case VoiceState.Listening:
                     petRobot.SetListeningState(true);
+                    petRobot.SetSpeakingState(false);
                     break;
                 case VoiceState.Speaking:
+                    petRobot.SetListeningState(false);
                     petRobot.SetSpeakingState(true);
                     break;
                 case VoiceState.Processing:
@@ -244,10 +281,13 @@ public partial class MainWindow : Window
         var hwnd = helper.EnsureHandle();
 
         int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-        exStyle |= WS_EX_TRANSPARENT;
-        exStyle |= WS_EX_LAYERED;
-        exStyle |= WS_EX_TOOLWINDOW;
-        exStyle |= WS_EX_NOACTIVATE;
+        // NOTE: Do NOT add WS_EX_TRANSPARENT — it makes the entire window
+        // (including the robot) transparent to mouse clicks.
+        // Instead, we rely on WPF's layered window hit testing:
+        // Background="{x:Null}" areas pass clicks through naturally.
+        exStyle |= WS_EX_LAYERED;       // Required for transparency
+        exStyle |= WS_EX_TOOLWINDOW;    // Hide from Alt+Tab
+        exStyle |= WS_EX_NOACTIVATE;    // Don't steal focus
         SetWindowLong(hwnd, GWL_EXSTYLE, exStyle);
     }
 

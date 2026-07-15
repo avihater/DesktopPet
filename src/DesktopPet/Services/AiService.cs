@@ -14,6 +14,9 @@ public class AiService
     private readonly HttpClient _http;
     private readonly List<ChatMessage> _history = new();
 
+    // Default timeout for chat requests
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -25,39 +28,48 @@ public class AiService
         _config = config;
         _http = new HttpClient
         {
-            Timeout = TimeSpan.FromSeconds(60)
+            Timeout = TimeSpan.FromSeconds(45) // Total HTTP timeout (including streaming)
         };
     }
 
-    /// <summary>
-    /// Get conversation history
-    /// </summary>
     public IReadOnlyList<ChatMessage> History => _history.AsReadOnly();
 
     /// <summary>
-    /// Send a user message and get streaming response
+    /// Send a user message and get streaming response.
     /// </summary>
-    public async IAsyncEnumerable<string> ChatStreamAsync(string userMessage)
+    /// <param name="userMessage">User's message text</param>
+    /// <param name="cancellationToken">Optional cancellation token</param>
+    public async IAsyncEnumerable<string> ChatStreamAsync(
+        string userMessage,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+        CancellationToken cancellationToken = default)
     {
         var cfg = _config.Config;
+
+        // Validate API key
+        if (string.IsNullOrWhiteSpace(cfg.ApiKey))
+        {
+            yield return "主人还没设置 API Key 呢~ 请先在设置中配置 DeepSeek 的 API Key！(◕‿◕)";
+            yield break;
+        }
 
         // Add user message to history
         var userMsg = new ChatMessage { Role = "user", Content = userMessage };
         _history.Add(userMsg);
-
-        // Trim history to max rounds
         TrimHistory(cfg.MaxHistoryRounds);
 
-        // Build messages array for API
-        var messages = new List<object>();
-        messages.Add(new { role = "system", content = _config.GetSystemPrompt() });
+        // Build messages array
+        var messages = new List<object>
+        {
+            new { role = "system", content = _config.GetSystemPrompt() }
+        };
 
         foreach (var msg in _history.TakeLast(cfg.MaxHistoryRounds * 2))
         {
             messages.Add(new { role = msg.Role, content = msg.Content });
         }
 
-        // Create request
+        // Build request
         var requestBody = new
         {
             model = cfg.ModelName,
@@ -82,22 +94,37 @@ public class AiService
         var assistantMsg = new ChatMessage { Role = "assistant", Content = "", IsStreaming = true };
         _history.Add(assistantMsg);
 
-        // Collect errors outside try/catch for yielding
+        // Create a linked cancellation token with timeout
+        using var timeoutCts = new CancellationTokenSource(RequestTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, timeoutCts.Token);
+
+        // Send request (with error collection outside try/catch for yield safety)
         string? errorMessage = null;
         HttpResponseMessage? response = null;
 
         try
         {
             response = await _http.SendAsync(request,
-                HttpCompletionOption.ResponseHeadersRead);
-            response.EnsureSuccessStatusCode();
+                HttpCompletionOption.ResponseHeadersRead,
+                linkedCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            if (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                errorMessage = "请求超时了~ 网络可能不太好，主人稍后再试试？(´・ω・`)";
+            else
+                errorMessage = "请求被取消了哦~";
+        }
+        catch (HttpRequestException ex)
+        {
+            errorMessage = $"网络连接失败：{ex.Message} (´;ω;`)\n请检查 API 地址和网络连接~";
         }
         catch (Exception ex)
         {
-            errorMessage = $"抱歉主人，连接失败了呢~ {ex.Message} (´;ω;`)";
+            errorMessage = $"出错了：{ex.Message} (´;ω;`)";
         }
 
-        // If error, yield the error message
         if (errorMessage != null)
         {
             assistantMsg.Content = errorMessage;
@@ -106,13 +133,36 @@ public class AiService
             yield break;
         }
 
-        // Stream the response (no yield in catch)
-        using var stream = await response!.Content.ReadAsStreamAsync();
+        // Check HTTP status
+        if (response is { IsSuccessStatusCode: false })
+        {
+            var statusCode = (int)response.StatusCode;
+            string statusMsg = statusCode switch
+            {
+                401 => "API Key 无效，请检查设置中的 Key 是否正确~",
+                402 => "API 余额不足，请充值后再试~",
+                429 => "请求太频繁了，稍等一下再试吧~",
+                500 => "服务器出了点问题，稍后再试~",
+                _ => $"服务器返回错误 ({statusCode})，请稍后再试~"
+            };
+            assistantMsg.Content = statusMsg;
+            assistantMsg.IsStreaming = false;
+            yield return statusMsg;
+            yield break;
+        }
+
+        // Stream the response
+        using var stream = await response!.Content.ReadAsStreamAsync(linkedCts.Token)
+            .ConfigureAwait(false);
         using var reader = new StreamReader(stream);
+        var receivedAnyChunk = false;
 
         while (!reader.EndOfStream)
         {
-            var line = await reader.ReadLineAsync();
+            linkedCts.Token.ThrowIfCancellationRequested();
+
+            var line = await reader.ReadLineAsync(linkedCts.Token).ConfigureAwait(false);
+
             if (string.IsNullOrWhiteSpace(line)) continue;
             if (!line.StartsWith("data: ")) continue;
 
@@ -133,21 +183,27 @@ public class AiService
                     }
                 }
             }
-            catch { /* skip malformed chunks */ }
+            catch { /* skip malformed SSE chunks */ }
 
             if (!string.IsNullOrEmpty(chunk))
             {
+                receivedAnyChunk = true;
                 assistantMsg.Content += chunk;
                 yield return chunk;
             }
         }
 
+        // If we received nothing, something went wrong
+        if (!receivedAnyChunk)
+        {
+            var msg = "唔…AI 没有返回内容呢，可能是模型繁忙，再试一次？(°◇°;)";
+            assistantMsg.Content += msg;
+            yield return msg;
+        }
+
         assistantMsg.IsStreaming = false;
     }
 
-    /// <summary>
-    /// Clear conversation history
-    /// </summary>
     public void ClearHistory()
     {
         _history.Clear();
@@ -155,12 +211,8 @@ public class AiService
 
     private void TrimHistory(int maxRounds)
     {
-        // Keep only system prompt context + last N rounds
-        // Each round = user + assistant = 2 messages
         int maxMessages = maxRounds * 2;
         while (_history.Count > maxMessages)
-        {
             _history.RemoveAt(0);
-        }
     }
 }
